@@ -1,0 +1,2714 @@
+<!DOCTYPE html>
+<html lang="en" class="cursor-on"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        window.addEventListener('click', (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fluid UI Library</title>
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&amp;family=Plus+Jakarta+Sans:wght@400;500;600;700;800&amp;family=Sora:wght@300;400;500;600;700&amp;family=JetBrains+Mono:wght@300;400;500;600&amp;display=swap" rel="stylesheet">
+
+  <style>
+    html { scroll-behavior: smooth; }
+
+    :root {
+      /* Color palette */
+      --bg-primary: radial-gradient(ellipse at top, #0f1026 0%, #050508 100%);
+      --bg-surface: rgba(20, 22, 40, 0.5);
+      --bg-surface-hover: rgba(28, 30, 56, 0.65);
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --border-glow: rgba(120, 140, 255, 0.25);
+
+      /* Glow colors */
+      --glow-primary: 120, 140, 255;
+      --glow-secondary: 96, 225, 255;
+      --glow-accent: 168, 120, 255;
+      --glow-success: 72, 208, 128;
+      --glow-warning: 255, 184, 108;
+      --glow-danger: 255, 108, 108;
+
+      /* Text */
+      --text-primary: rgba(255, 255, 255, 0.98);
+      --text-secondary: rgba(255, 255, 255, 0.72);
+      --text-tertiary: rgba(255, 255, 255, 0.48);
+      --text: rgba(255, 255, 255, 0.98);
+      --accent: 120, 140, 255;
+
+      /* Radius */
+      --radius-xs: 8px;
+      --radius-sm: 12px;
+      --radius-md: 16px;
+      --radius-lg: 20px;
+      --radius-xl: 28px;
+      --radius-full: 999px;
+
+      /* Spacing */
+      --space-xs: 0.25rem;
+      --space-sm: 0.5rem;
+      --space-md: 1rem;
+      --space-lg: 1.5rem;
+      --space-xl: 2rem;
+      --space-2xl: 3rem;
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    body {
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont,
+        sans-serif;
+      min-height: 100dvh;
+      overflow-x: hidden;
+      position: relative;
+    }
+
+    /* Animated background blobs */
+    .bg-blobs {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 0;
+      overflow: hidden;
+    }
+
+    .blob {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(120px);
+      opacity: 0.16;
+      will-change: transform;
+      mix-blend-mode: screen;
+    }
+
+    .blob-1 {
+      width: 40vw;
+      height: 40vw;
+      top: -10%;
+      left: -10%;
+      background: radial-gradient(
+        circle,
+        rgba(var(--glow-primary), 0.9) 0%,
+        transparent 70%
+      );
+      animation: blob-float-1 12s ease-in-out infinite alternate;
+    }
+
+    .blob-2 {
+      width: 36vw;
+      height: 36vw;
+      top: 20%;
+      right: -8%;
+      background: radial-gradient(
+        circle,
+        rgba(var(--glow-secondary), 0.9) 0%,
+        transparent 70%
+      );
+      animation: blob-float-2 14s ease-in-out infinite alternate;
+    }
+
+    .blob-3 {
+      width: 32vw;
+      height: 32vw;
+      bottom: -10%;
+      left: 20%;
+      background: radial-gradient(
+        circle,
+        rgba(var(--glow-accent), 0.8) 0%,
+        transparent 70%
+      );
+      animation: blob-float-3 16s ease-in-out infinite alternate;
+    }
+
+    @keyframes blob-float-1 {
+      0% {
+        transform: translate(0, 0) scale(1);
+      }
+      50% {
+        transform: translate(2%, 3%) scale(1.04);
+      }
+      100% {
+        transform: translate(-1%, 1%) scale(0.98);
+      }
+    }
+
+    @keyframes blob-float-2 {
+      0% {
+        transform: translate(0, 0) scale(1);
+      }
+      50% {
+        transform: translate(-3%, 2%) scale(1.05);
+      }
+      100% {
+        transform: translate(1%, -2%) scale(0.97);
+      }
+    }
+
+    @keyframes blob-float-3 {
+      0% {
+        transform: translate(0, 0) scale(1);
+      }
+      50% {
+        transform: translate(2%, -3%) scale(1.06);
+      }
+      100% {
+        transform: translate(-2%, 1%) scale(0.96);
+      }
+    }
+
+    /* Noise grain */
+    .noise {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 1;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140' viewBox='0 0 700 700'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='700' height='700' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E");
+      opacity: 0.25;
+      mix-blend-mode: soft-light;
+    }
+
+    header {
+      position: relative;
+      z-index: 2;
+      padding: clamp(4rem, 9vw, 5.5rem) clamp(1rem, 5vw, 2rem) 0;
+      text-align: center;
+    }
+
+    main {
+      position: relative;
+      z-index: 2;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: clamp(1rem, 4vw, 2rem) clamp(1rem, 5vw, 2rem)
+        clamp(4rem, 8vw, 6rem);
+      display: flex;
+      flex-direction: column;
+      gap: clamp(2rem, 6vw, 4rem);
+    }
+
+    section {
+      display: flex;
+      flex-direction: column;
+      gap: clamp(1rem, 3vw, 1.5rem);
+    }
+
+    .section-header {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-sm);
+    }
+
+    .section-label {
+      font-family: "JetBrains Mono", monospace;
+      font-size: clamp(0.75rem, 2vw, 0.875rem);
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--text-tertiary);
+    }
+
+    /* Typography */
+    .display {
+      font-family: "Plus Jakarta Sans", "Sora", Inter, sans-serif;
+      font-size: clamp(2.5rem, 8vw, 5.5rem);
+      line-height: 1.02;
+      letter-spacing: -0.04em;
+      font-weight: 800;
+      background: radial-gradient(
+          ellipse at top,
+          rgba(255, 255, 255, 0.98) 0%,
+          rgba(255, 255, 255, 0.72) 70%,
+          rgba(255, 255, 255, 0.48) 100%
+        )
+        text;
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    h1 {
+      font-family: "Plus Jakarta Sans", "Sora", Inter, sans-serif;
+      font-size: clamp(2rem, 6vw, 3.5rem);
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+      font-weight: 700;
+    }
+
+    h2 {
+      font-family: "Plus Jakarta Sans", "Sora", Inter, sans-serif;
+      font-size: clamp(1.5rem, 4vw, 2.25rem);
+      line-height: 1.12;
+      letter-spacing: -0.02em;
+      font-weight: 700;
+    }
+
+    h3 {
+      font-family: "Sora", Inter, sans-serif;
+      font-size: clamp(1.25rem, 3vw, 1.75rem);
+      line-height: 1.16;
+      letter-spacing: -0.02em;
+      font-weight: 600;
+    }
+
+    h4 {
+      font-family: "Sora", Inter, sans-serif;
+      font-size: clamp(1.125rem, 2.5vw, 1.375rem);
+      line-height: 1.2;
+      letter-spacing: -0.015em;
+      font-weight: 600;
+    }
+
+    h5 {
+      font-size: clamp(1rem, 2vw, 1.125rem);
+      line-height: 1.24;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+
+    h6 {
+      font-size: clamp(0.95rem, 2vw, 1rem);
+      line-height: 1.28;
+      font-weight: 600;
+    }
+
+    p {
+      color: var(--text-secondary);
+      font-size: clamp(1rem, 2vw, 1.125rem);
+      line-height: 1.8;
+      max-width: 70ch;
+    }
+
+    .text-sm {
+      font-size: clamp(0.875rem, 2vw, 0.95rem);
+      line-height: 1.7;
+    }
+
+    .text-xs {
+      font-size: clamp(0.75rem, 2vw, 0.875rem);
+      line-height: 1.6;
+    }
+
+    .mono {
+      font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo,
+        Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+
+    .fluid-text {
+      background: linear-gradient(
+        120deg,
+        rgba(255, 255, 255, 0.98) 0%,
+        rgba(160, 180, 255, 0.92) 40%,
+        rgba(120, 225, 255, 0.88) 70%,
+        rgba(255, 255, 255, 0.98) 100%
+      );
+      background-size: 200% 100%;
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      animation: fluid-shift 6s ease-in-out infinite;
+    }
+
+    @keyframes fluid-shift {
+      0%,
+      100% {
+        background-position: 0% 50%;
+      }
+      50% {
+        background-position: 100% 50%;
+      }
+    }
+
+    /* Surfaces & Glass */
+    .surface {
+      position: relative;
+      background: var(--bg-surface);
+      backdrop-filter: blur(14px) saturate(140%);
+      -webkit-backdrop-filter: blur(14px) saturate(140%);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      box-shadow: 0 40px 120px -40px rgba(40, 60, 140, 0.4),
+        inset 0 1px 0 rgba(255, 255, 255, 0.08);
+      transition: all 280ms cubic-bezier(0.22, 1, 0.36, 1);
+      will-change: transform, border-color, background, box-shadow;
+    }
+
+    .surface:hover {
+      background: var(--bg-surface-hover);
+      border-color: var(--border-glow);
+      transform: translateY(-2px);
+      box-shadow: 0 60px 160px -40px rgba(80, 100, 220, 0.45),
+        0 0 0 1px rgba(var(--glow-primary), 0.15) inset,
+        inset 0 1px 0 rgba(255, 255, 255, 0.1);
+    }
+
+    .surface:active {
+      transform: translateY(-1px) scale(0.995);
+    }
+
+    .glow-ring {
+      position: relative;
+    }
+
+    .glow-ring::before {
+      content: "";
+      position: absolute;
+      inset: -1px;
+      border-radius: inherit;
+      background: radial-gradient(
+        120% 120% at 50% 0%,
+        rgba(var(--glow-primary), 0.22) 0%,
+        rgba(var(--glow-primary), 0.08) 40%,
+        transparent 70%
+      );
+      opacity: 0;
+      transition: opacity 280ms ease;
+      pointer-events: none;
+      z-index: -1;
+      filter: blur(8px);
+    }
+
+    .glow-ring:hover::before {
+      opacity: 1;
+    }
+
+    .glow-ring--secondary::before {
+      background: radial-gradient(
+        120% 120% at 50% 0%,
+        rgba(var(--glow-secondary), 0.22) 0%,
+        rgba(var(--glow-secondary), 0.08) 40%,
+        transparent 70%
+      );
+    }
+
+    .glow-ring--accent::before {
+      background: radial-gradient(
+        120% 120% at 50% 0%,
+        rgba(var(--glow-accent), 0.22) 0%,
+        rgba(var(--glow-accent), 0.08) 40%,
+        transparent 70%
+      );
+    }
+
+    .glow-ring--success::before {
+      background: radial-gradient(
+        120% 120% at 50% 0%,
+        rgba(var(--glow-success), 0.22) 0%,
+        rgba(var(--glow-success), 0.08) 40%,
+        transparent 70%
+      );
+    }
+
+    .glow-ring--warning::before {
+      background: radial-gradient(
+        120% 120% at 50% 0%,
+        rgba(var(--glow-warning), 0.22) 0%,
+        rgba(var(--glow-warning), 0.08) 40%,
+        transparent 70%
+      );
+    }
+
+    .glow-ring--danger::before {
+      background: radial-gradient(
+        120% 120% at 50% 0%,
+        rgba(var(--glow-danger), 0.22) 0%,
+        rgba(var(--glow-danger), 0.08) 40%,
+        transparent 70%
+      );
+    }
+
+    /* Buttons */
+    .button-group {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: var(--space-md);
+    }
+
+    .btn {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: var(--space-sm);
+      padding: 0.72rem 1.5rem;
+      border-radius: var(--radius-full);
+      font-size: clamp(0.95rem, 2vw, 1rem);
+      font-weight: 500;
+      letter-spacing: -0.01em;
+      text-decoration: none;
+      cursor: pointer;
+      border: 1px solid transparent;
+      transition: all 220ms cubic-bezier(0.22, 1, 0.36, 1);
+      white-space: nowrap;
+      will-change: transform, box-shadow, background, border-color;
+      backdrop-filter: blur(10px) saturate(140%);
+      -webkit-backdrop-filter: blur(10px) saturate(140%);
+    }
+
+    .btn:focus-visible {
+      outline: 2px solid rgba(var(--glow-primary), 0.6);
+      outline-offset: 2px;
+    }
+
+    .btn-primary {
+      color: #f5f7ff;
+      background: radial-gradient(
+          ellipse at top,
+          rgba(var(--glow-primary), 0.32) 0%,
+          rgba(40, 60, 160, 0.28) 60%,
+          rgba(10, 12, 30, 0.4) 100%
+        ),
+        linear-gradient(
+          160deg,
+          rgba(255, 255, 255, 0.22) 0%,
+          rgba(255, 255, 255, 0.08) 100%
+        );
+      border-color: rgba(var(--glow-primary), 0.4);
+      box-shadow: 0 20px 80px -30px rgba(var(--glow-primary), 0.9),
+        inset 0 1px 0 rgba(255, 255, 255, 0.28);
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-1px) scale(1.01);
+      box-shadow: 0 30px 100px -30px rgba(var(--glow-primary), 1),
+        inset 0 1px 0 rgba(255, 255, 255, 0.32);
+    }
+
+    .btn-secondary {
+      color: var(--text-primary);
+      background: linear-gradient(
+        160deg,
+        rgba(255, 255, 255, 0.16) 0%,
+        rgba(255, 255, 255, 0.08) 60%,
+        rgba(20, 22, 40, 0.4) 100%
+      );
+      border-color: rgba(255, 255, 255, 0.22);
+      box-shadow: 0 20px 80px -32px rgba(120, 140, 200, 0.8),
+        inset 0 1px 0 rgba(255, 255, 255, 0.22);
+    }
+
+    .btn-ghost {
+      color: var(--text-secondary);
+      background: rgba(255, 255, 255, 0.06);
+      border-color: rgba(255, 255, 255, 0.12);
+      backdrop-filter: blur(8px) saturate(130%);
+      -webkit-backdrop-filter: blur(8px) saturate(130%);
+    }
+
+    .btn-ghost:hover {
+      color: var(--text-primary);
+      background: rgba(255, 255, 255, 0.08);
+    }
+
+    .btn-success {
+      color: #f6fff9;
+      background: radial-gradient(
+          ellipse at top,
+          rgba(var(--glow-success), 0.32) 0%,
+          rgba(40, 120, 80, 0.28) 60%,
+          rgba(10, 20, 16, 0.4) 100%
+        ),
+        linear-gradient(
+          160deg,
+          rgba(255, 255, 255, 0.22) 0%,
+          rgba(255, 255, 255, 0.08) 100%
+        );
+      border-color: rgba(var(--glow-success), 0.4);
+      box-shadow: 0 20px 80px -30px rgba(var(--glow-success), 0.9),
+        inset 0 1px 0 rgba(255, 255, 255, 0.26);
+    }
+
+    .btn-warning {
+      color: #1f1405;
+      background: radial-gradient(
+          ellipse at top,
+          rgba(var(--glow-warning), 0.38) 0%,
+          rgba(160, 120, 60, 0.28) 60%,
+          rgba(30, 20, 10, 0.4) 100%
+        ),
+        linear-gradient(
+          160deg,
+          rgba(255, 255, 255, 0.26) 0%,
+          rgba(255, 255, 255, 0.12) 100%
+        );
+      border-color: rgba(var(--glow-warning), 0.45);
+      box-shadow: 0 20px 80px -30px rgba(var(--glow-warning), 0.95),
+        inset 0 1px 0 rgba(255, 255, 255, 0.32);
+    }
+
+    .btn-danger {
+      color: #fff5f5;
+      background: radial-gradient(
+          ellipse at top,
+          rgba(var(--glow-danger), 0.34) 0%,
+          rgba(160, 60, 60, 0.28) 60%,
+          rgba(30, 10, 10, 0.4) 100%
+        ),
+        linear-gradient(
+          160deg,
+          rgba(255, 255, 255, 0.22) 0%,
+          rgba(255, 255, 255, 0.08) 100%
+        );
+      border-color: rgba(var(--glow-danger), 0.42);
+      box-shadow: 0 20px 80px -30px rgba(var(--glow-danger), 0.95),
+        inset 0 1px 0 rgba(255, 255, 255, 0.28);
+    }
+
+    .btn-cta {
+      padding: 0.88rem 2rem;
+      font-size: clamp(1rem, 2vw, 1.125rem);
+    }
+
+    .btn:active {
+      transform: scale(0.995);
+    }
+
+    .btn--fluid {
+      position: relative;
+      overflow: hidden;
+      clip-path: inset(0 round var(--radius-full));
+    }
+
+    .btn--fluid::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(
+        circle at 50% 0%,
+        rgba(255, 255, 255, 0.22) 0%,
+        transparent 70%
+      );
+      opacity: 0.4;
+      mix-blend-mode: screen;
+      pointer-events: none;
+    }
+
+    .btn--fluid::before {
+      content: "";
+      position: absolute;
+      top: -40%;
+      left: -60%;
+      width: 60%;
+      height: 180%;
+      background: linear-gradient(
+        120deg,
+        rgba(255, 255, 255, 0) 0%,
+        rgba(255, 255, 255, 0.28) 50%,
+        rgba(255, 255, 255, 0) 100%
+      );
+      transform: translateX(-100%) rotate(20deg);
+      /* soft glow shine, set here so it is identical on every fluid button
+         (previously only .glow-ring buttons got the blur via a class clash) */
+      border-radius: inherit;
+      filter: blur(8px);
+      opacity: 0;
+      z-index: -1;
+      transition: transform 900ms cubic-bezier(0.22, 1, 0.36, 1),
+        opacity 220ms ease;
+      pointer-events: none;
+      mix-blend-mode: screen;
+    }
+
+    /* Reactive glass glow buttons */
+    .btn--glass {
+      position: relative;
+      overflow: visible;
+      isolation: isolate;
+      border: 1px solid rgba(255, 255, 255, 0.28);
+      background: radial-gradient(
+          140% 140% at 50% 0%,
+          rgba(255, 255, 255, 0.28) 0%,
+          rgba(255, 255, 255, 0.18) 40%,
+          rgba(16, 18, 36, 0.72) 100%
+        );
+      backdrop-filter: blur(16px) saturate(150%);
+      -webkit-backdrop-filter: blur(16px) saturate(150%);
+      box-shadow: 0 20px 80px -32px rgba(120, 140, 200, 0.8),
+        inset 0 1px 0 rgba(255, 255, 255, 0.4);
+      color: #f8f9ff;
+    }
+
+    .btn--glass::before,
+    .btn--glass::after {
+      content: "";
+      position: absolute;
+      pointer-events: none;
+      border-radius: inherit;
+      will-change: transform, opacity;
+    }
+
+    .btn--glass::before {
+      inset: -2px;
+      background: radial-gradient(
+        200% 200% at var(--glow-x, 50%) var(--glow-y, -10%),
+        rgba(var(--glow-primary), 0.38) 0%,
+        rgba(var(--glow-primary), 0.16) 40%,
+        transparent 70%
+      );
+      filter: blur(14px);
+      opacity: 0;
+      transition: opacity 320ms cubic-bezier(0.22, 1, 0.36, 1);
+      z-index: -2;
+    }
+
+    .btn--glass::after {
+      top: -24%;
+      left: -12%;
+      right: -12%;
+      height: 78%;
+      background: radial-gradient(
+        ellipse at var(--glow-x, 50%) 0%,
+        rgba(255, 255, 255, 0.42) 0%,
+        rgba(255, 255, 255, 0.18) 40%,
+        transparent 82%
+      );
+      mix-blend-mode: screen;
+      opacity: 0;
+      transition: opacity 320ms cubic-bezier(0.22, 1, 0.36, 1);
+      z-index: -1;
+      filter: blur(10px) saturate(130%);
+      transform: translateY(-12%);
+      pointer-events: none;
+    }
+
+    .btn--glass:hover::before,
+    .btn--glass:hover::after {
+      opacity: 0.95;
+    }
+
+    .btn--glass:active::after {
+      opacity: 0.7;
+    }
+
+    .btn--glass > span {
+      position: relative;
+      z-index: 1;
+    }
+
+    /* Inner glow variants */
+    .btn--glass--secondary::before {
+      background: radial-gradient(
+        200% 200% at var(--glow-x, 50%) var(--glow-y, -10%),
+        rgba(var(--glow-secondary), 0.38) 0%,
+        rgba(var(--glow-secondary), 0.16) 40%,
+        transparent 70%
+      );
+    }
+
+    .btn--glass--accent::before {
+      background: radial-gradient(
+        200% 200% at var(--glow-x, 50%) var(--glow-y, -10%),
+        rgba(var(--glow-accent), 0.38) 0%,
+        rgba(var(--glow-accent), 0.16) 40%,
+        transparent 70%
+      );
+    }
+
+    .btn--glass--success::before {
+      background: radial-gradient(
+        200% 200% at var(--glow-x, 50%) var(--glow-y, -10%),
+        rgba(var(--glow-success), 0.38) 0%,
+        rgba(var(--glow-success), 0.16) 40%,
+        transparent 70%
+      );
+    }
+
+    .btn--glass--warning::before {
+      background: radial-gradient(
+        200% 200% at var(--glow-x, 50%) var(--glow-y, -10%),
+        rgba(var(--glow-warning), 0.38) 0%,
+        rgba(var(--glow-warning), 0.16) 40%,
+        transparent 70%
+      );
+    }
+
+    .btn--glass--danger::before {
+      background: radial-gradient(
+        200% 200% at var(--glow-x, 50%) var(--glow-y, -10%),
+        rgba(var(--glow-danger), 0.38) 0%,
+        rgba(var(--glow-danger), 0.16) 40%,
+        transparent 70%
+      );
+    }
+
+    .btn--fluid:hover::before {
+      opacity: 1;
+      transform: translateX(220%) rotate(20deg);
+    }
+
+    /* Chips, Pills, Badges */
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-xs);
+      padding: 0.4rem 0.85rem;
+      border-radius: var(--radius-full);
+      font-size: clamp(0.75rem, 2vw, 0.875rem);
+      letter-spacing: 0.01em;
+      color: var(--text-secondary);
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      backdrop-filter: blur(8px) saturate(140%);
+      -webkit-backdrop-filter: blur(8px) saturate(140%);
+      transition: all 200ms ease;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    }
+
+    .chip:hover {
+      color: var(--text-primary);
+      border-color: rgba(var(--glow-primary), 0.4);
+      background: rgba(255, 255, 255, 0.1);
+    }
+
+    .chip--glow {
+      color: rgba(var(--glow-primary), 1);
+      background: rgba(var(--glow-primary), 0.14);
+      border-color: rgba(var(--glow-primary), 0.4);
+      box-shadow: 0 10px 60px -30px rgba(var(--glow-primary), 0.9),
+        inset 0 1px 0 rgba(255, 255, 255, 0.24);
+    }
+
+    /* Cards */
+    .grid {
+      display: grid;
+      gap: clamp(1rem, 3vw, 1.5rem);
+    }
+
+    .grid-3 {
+      grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+    }
+
+    .grid-2 {
+      grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
+    }
+
+    .card {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-lg);
+      padding: clamp(1.25rem, 4vw, 1.75rem);
+      height: 100%;
+    }
+
+    .card-header {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-sm);
+    }
+
+    .card-footer {
+      margin-top: auto;
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-sm);
+      align-items: center;
+    }
+
+    /* Inputs */
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-sm);
+    }
+
+    .label {
+      font-size: clamp(0.875rem, 2vw, 0.95rem);
+      color: var(--text-secondary);
+    }
+
+    .input {
+      width: 100%;
+      padding: 0.72rem 1rem 0.72rem 1rem;
+      border-radius: var(--radius-md);
+      color: var(--text-primary);
+      background: rgba(12, 14, 28, 0.6);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      backdrop-filter: blur(10px) saturate(140%);
+      -webkit-backdrop-filter: blur(10px) saturate(140%);
+      font-size: clamp(0.95rem, 2vw, 1rem);
+      transition: all 200ms ease;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08),
+        0 20px 80px -40px rgba(60, 80, 160, 0.5);
+    }
+
+    .input::placeholder {
+      color: var(--text-tertiary);
+    }
+
+    .input:focus {
+      outline: none;
+      border-color: rgba(var(--glow-primary), 0.5);
+      box-shadow: 0 0 0 3px rgba(var(--glow-primary), 0.15),
+        0 30px 100px -40px rgba(var(--glow-primary), 0.6),
+        inset 0 1px 0 rgba(255, 255, 255, 0.12);
+    }
+
+    /* Fluid dividers & shapes */
+    .divider {
+      height: 1px;
+      width: 100%;
+      background: radial-gradient(
+        ellipse at center,
+        rgba(255, 255, 255, 0.22) 0%,
+        rgba(255, 255, 255, 0.08) 60%,
+        transparent 100%
+      );
+    }
+
+    .squircle {
+      border-radius: clamp(20px, 4vw, 28px);
+    }
+
+    .pill {
+      border-radius: var(--radius-full);
+    }
+
+    /* Animations reference */
+    .demo-orb {
+      width: clamp(80px, 12vw, 140px);
+      height: clamp(80px, 12vw, 140px);
+      border-radius: 50%;
+      background: radial-gradient(
+        circle at 50% 30%,
+        rgba(255, 255, 255, 0.95) 0%,
+        rgba(var(--glow-primary), 0.4) 40%,
+        rgba(20, 24, 60, 0.9) 100%
+      );
+      box-shadow: 0 40px 120px -40px rgba(var(--glow-primary), 0.95),
+        inset 0 10px 40px -20px rgba(255, 255, 255, 0.8);
+      animation: orb-breathe 4s ease-in-out infinite alternate,
+        orb-drift 7s ease-in-out infinite alternate;
+      will-change: transform, filter;
+    }
+
+    @keyframes orb-breathe {
+      0% {
+        transform: scale(0.98);
+        filter: brightness(0.98);
+      }
+      100% {
+        transform: scale(1.04);
+        filter: brightness(1.08);
+      }
+    }
+
+    @keyframes orb-drift {
+      0% {
+        transform: translate(0, 0) scale(0.98);
+      }
+      50% {
+        transform: translate(4px, -6px) scale(1.02);
+      }
+      100% {
+        transform: translate(-2px, 4px) scale(1.04);
+      }
+    }
+
+    .ripple {
+      position: relative;
+      overflow: hidden;
+      clip-path: inset(0 round inherit);
+    }
+
+    .ripple::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 120%;
+      padding-bottom: 120%;
+      border-radius: 50%;
+      background: radial-gradient(
+        circle,
+        rgba(255, 255, 255, 0.28) 0%,
+        transparent 70%
+      );
+      transform: translate(-50%, -50%) scale(0);
+      opacity: 0;
+      transition: transform 680ms cubic-bezier(0.22, 1, 0.36, 1),
+        opacity 420ms ease;
+      pointer-events: none;
+    }
+
+    .ripple:active::after {
+      transform: translate(-50%, -50%) scale(1);
+      opacity: 0.6;
+    }
+
+    /* Tilt (3D subtle) */
+    .tilt {
+      transform-style: preserve-3d;
+      will-change: transform;
+      transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .tilt:hover {
+      transform: perspective(800px) rotateX(var(--rx, 0deg))
+        rotateY(var(--ry, 0deg)) translateZ(6px);
+    }
+
+    .tilt:active {
+      transform: perspective(800px) rotateX(var(--rx, 0deg))
+        rotateY(var(--ry, 0deg)) translateZ(2px) scale(0.995);
+    }
+    .float {
+      animation: float 4s ease-in-out infinite;
+    }
+
+    @keyframes float {
+      0%,
+      100% {
+        transform: translateY(0);
+      }
+      50% {
+        transform: translateY(-6px);
+      }
+    }
+
+    .pulse-glow {
+      animation: pulse-glow 2.6s ease-in-out infinite alternate;
+    }
+
+    @keyframes pulse-glow {
+      0% {
+        box-shadow: 0 0 0 0 rgba(var(--glow-primary), 0.4),
+          inset 0 1px 0 rgba(255, 255, 255, 0.24);
+      }
+      100% {
+        box-shadow: 0 0 0 8px rgba(var(--glow-primary), 0),
+          0 30px 120px -40px rgba(var(--glow-primary), 0.9),
+          inset 0 1px 0 rgba(255, 255, 255, 0.28);
+      }
+    }
+
+    .shimmer {
+      position: relative;
+      overflow: hidden;
+      clip-path: inset(0 round inherit);
+    }
+
+    .shimmer::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(
+        120deg,
+        rgba(255, 255, 255, 0) 0%,
+        rgba(255, 255, 255, 0.22) 50%,
+        rgba(255, 255, 255, 0) 100%
+      );
+      transform: translateX(-100%);
+      animation: shimmer 2.8s ease-in-out infinite;
+      mix-blend-mode: screen;
+    }
+
+    @keyframes shimmer {
+      0% {
+        transform: translateX(-100%);
+      }
+      100% {
+        transform: translateX(100%);
+      }
+    }
+
+    .fade-in {
+      animation: fade-in 680ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    }
+
+    @keyframes fade-in {
+      from {
+        opacity: 0;
+        transform: translateY(8px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .fade-in-up {
+      animation: fade-in-up 720ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    }
+
+    @keyframes fade-in-up {
+      from {
+        opacity: 0;
+        transform: translateY(10px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .fade-in-scale {
+      animation: fade-in-scale 640ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    }
+
+    @keyframes fade-in-scale {
+      from {
+        opacity: 0;
+        transform: scale(0.985);
+      }
+      to {
+        opacity: 1;
+        transform: scale(1);
+      }
+    }
+
+    .scale-in {
+      animation: scale-in 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    }
+
+    @keyframes scale-in {
+      from {
+        opacity: 0;
+        transform: scale(0.98);
+      }
+      to {
+        opacity: 1;
+        transform: scale(1);
+      }
+    }
+
+    .slide-up {
+      animation: slide-up 680ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    }
+
+    @keyframes slide-up {
+      from {
+        opacity: 0;
+        transform: translateY(12px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .slide-down {
+      animation: slide-down 680ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    }
+
+    @keyframes slide-down {
+      from {
+        opacity: 0;
+        transform: translateY(-12px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .slide-in-left {
+      animation: slide-in-left 680ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    }
+
+    @keyframes slide-in-left {
+      from {
+        opacity: 0;
+        transform: translateX(-12px);
+      }
+      to {
+        opacity: 1;
+        transform: translateX(0);
+      }
+    }
+
+    .slide-in-right {
+      animation: slide-in-right 680ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    }
+
+    @keyframes slide-in-right {
+      from {
+        opacity: 0;
+        transform: translateX(12px);
+      }
+      to {
+        opacity: 1;
+        transform: translateX(0);
+      }
+    }
+
+    .fluid-flow {
+      animation: fluid-flow 6s ease-in-out infinite alternate;
+    }
+
+    @keyframes fluid-flow {
+      0% {
+        border-radius: clamp(20px, 4vw, 28px) clamp(20px, 4vw, 28px)
+          clamp(16px, 3vw, 20px) clamp(16px, 3vw, 20px);
+        transform: scale(1);
+      }
+      50% {
+        border-radius: clamp(16px, 3vw, 20px) clamp(24px, 5vw, 32px)
+          clamp(24px, 5vw, 32px) clamp(16px, 3vw, 20px);
+        transform: scale(1.008);
+      }
+      100% {
+        border-radius: clamp(24px, 5vw, 32px) clamp(16px, 3vw, 20px)
+          clamp(16px, 3vw, 20px) clamp(24px, 5vw, 32px);
+        transform: scale(0.996);
+      }
+    }
+
+    .fluid-morph {
+      animation: fluid-morph 8s ease-in-out infinite;
+    }
+
+    @keyframes fluid-morph {
+      0%,
+      100% {
+        border-radius: clamp(20px, 4vw, 28px);
+        transform: translateY(0) scale(1);
+      }
+      25% {
+        border-radius: clamp(16px, 3vw, 24px) clamp(28px, 6vw, 40px)
+          clamp(20px, 4vw, 28px) clamp(20px, 4vw, 28px);
+        transform: translateY(-1px) scale(1.01);
+      }
+      50% {
+        border-radius: clamp(28px, 6vw, 40px) clamp(16px, 3vw, 20px)
+          clamp(28px, 6vw, 40px) clamp(16px, 3vw, 20px);
+        transform: translateY(0) scale(0.998);
+      }
+      75% {
+        border-radius: clamp(20px, 4vw, 28px) clamp(20px, 4vw, 28px)
+          clamp(28px, 6vw, 40px) clamp(16px, 3vw, 20px);
+        transform: translateY(1px) scale(1.004);
+      }
+    }
+
+    .blob-pulse {
+      animation: blob-pulse 3.2s ease-in-out infinite alternate;
+    }
+
+    @keyframes blob-pulse {
+      0% {
+        transform: scale(0.985);
+        filter: brightness(0.98);
+      }
+      100% {
+        transform: scale(1.02);
+        filter: brightness(1.05);
+      }
+    }
+
+    .sway {
+      animation: sway 5.6s ease-in-out infinite;
+    }
+
+    @keyframes sway {
+      0%,
+      100% {
+        transform: rotate(-0.5deg) translateX(0);
+      }
+      50% {
+        transform: rotate(0.5deg) translateX(2px);
+      }
+    }
+
+    .breath {
+      animation: breath 4.8s ease-in-out infinite;
+    }
+
+    @keyframes breath {
+      0%,
+      100% {
+        transform: scale(1);
+        opacity: 0.98;
+      }
+      50% {
+        transform: scale(1.012);
+        opacity: 1;
+      }
+    }
+
+    code {
+      font-family: "JetBrains Mono", monospace;
+      background: rgba(12, 14, 28, 0.7);
+      padding: 0.15rem 0.45rem;
+      border-radius: var(--radius-xs);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+    }
+
+    .tag {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.875rem;
+      color: var(--text-tertiary);
+    }
+
+    footer {
+      position: relative;
+      z-index: 2;
+      text-align: center;
+      padding: 0 clamp(1rem, 5vw, 2rem) clamp(2rem, 6vw, 4rem);
+      color: var(--text-tertiary);
+    }
+
+
+    /* Header paragraph centered */
+    header p {
+      margin-left: auto;
+      margin-right: auto;
+      text-align: center;
+    }
+
+    /* Novify button (top of page) */
+    .novify-wrap {
+      position: fixed;
+      top: calc(clamp(1rem, 3vw, 1.5rem) + env(safe-area-inset-top, 0px));
+      left: 0;
+      right: 0;
+      z-index: 10;
+      display: flex;
+      justify-content: center;
+      pointer-events: none;
+    }
+
+    .novify-wrap .btn {
+      pointer-events: auto;
+    }
+
+    #novify-btn {
+      background-color: rgba(10, 12, 30, 0.35);
+      backdrop-filter: blur(18px) saturate(160%);
+      -webkit-backdrop-filter: blur(18px) saturate(160%);
+    }
+
+    ::selection {
+      background: rgba(var(--glow-primary), 0.32);
+      color: var(--text-primary);
+    }
+
+    /* Cursor - pulled from falsecloudd-preview.html (glow removed) */
+    .cur {
+      position: fixed;
+      top: 0;
+      left: 0;
+      pointer-events: none;
+      z-index: 9999;
+      opacity: 0;
+      transition: opacity 0.2s;
+    }
+
+    .cursor-on .cur {
+      opacity: 1;
+    }
+
+    .cursor-out .cur {
+      opacity: 0;
+    }
+
+    .cur.dot {
+      width: 8px;
+      height: 8px;
+    }
+
+    .cur.dot b {
+      display: block;
+      width: 100%;
+      height: 100%;
+      will-change: transform, filter;
+    }
+
+    .cur.dot i {
+      display: block;
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+      background: var(--text);
+      /* Glow removed */
+      box-shadow: none;
+      transition: transform 0.25s cubic-bezier(0.2, 0.8, 0.2, 1),
+        background-color 0.25s, box-shadow 0.25s;
+    }
+
+    .cur.dot.hot i {
+      transform: scale(1.7);
+      box-shadow: none;
+    }
+
+    .cur.dot.down i {
+      transform: scale(0.4);
+      transition-duration: 0.08s;
+    }
+
+    .cur.dot.hot.down i {
+      transform: scale(0.4);
+    }
+
+    .cursor-on,
+    html.cursor-on * {
+      cursor: none !important;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .blob,
+      .demo-orb,
+      .btn--fluid::before,
+      .shimmer::after,
+      .float,
+      .pulse-glow,
+      .fluid-flow,
+      .fluid-text,
+      .orb-breathe,
+      .orb-drift {
+        animation: none !important;
+        transition: none !important;
+      }
+    }
+  </style>
+</head>
+
+<body id="artifacts-component-root-html">
+  <!-- Cursor -->
+  <div class="cur dot hot" id="cd" aria-hidden="true" style="transform: translate3d(394.988px, 44.9096px, 0px) translate(-50%, -50%);">
+    <b style="transform: none;"><i></i></b>
+  </div>
+
+  <!-- Background FX -->
+  <div class="bg-blobs">
+    <div class="blob blob-1"></div>
+    <div class="blob blob-2"></div>
+    <div class="blob blob-3"></div>
+  </div>
+
+  <!-- Novify button -->
+  <div class="novify-wrap fade-in">
+    <button type="button" id="novify-btn" class="btn btn-primary btn--fluid ripple glow-ring">
+      <span>novify your site</span>
+    </button>
+  </div>
+
+  <div class="noise"></div>
+
+  <!-- Header -->
+  <header class="fade-in">
+    <div class="section-label">Fluid • Minimal • Glowy UI Library</div>
+    <h1 class="display">
+      Fluid UI <span class="fluid-text">Library</span>
+    </h1>
+    <p>
+      A minimal, fluid, and glowy component reference built for feeding to
+      another AI. Includes titles, fonts, test buttons, surfaces, and fluid
+      animations for easy design reuse.
+    </p>
+    <div class="button-group" style="justify-content: center; margin-top: var(--space-lg)">
+      <a class="btn btn-primary btn-cta btn--fluid ripple glow-ring" href="#buttons">
+        <span>Test Buttons</span>
+      </a>
+      <a class="btn btn-secondary btn--fluid ripple glow-ring glow-ring--secondary" href="#typography">
+        <span>Fonts &amp; Titles</span>
+      </a>
+      <a class="btn btn-ghost btn--fluid ripple" href="#animations">
+        <span>Animations</span>
+      </a>
+    </div>
+  </header>
+
+  <main>
+    <!-- Typography / Fonts / Titles -->
+    <section id="typography">
+      <div class="section-header slide-up">
+        <span class="section-label">01 — Typography</span>
+        <h2>Fonts, Titles &amp; Type Scale</h2>
+        <p>
+          Font families: <code>Plus Jakarta Sans</code> (Display/H1–H2),
+          <code>Sora</code> (H3–H4), <code>Inter</code> (body/UI),
+          <code>JetBrains Mono</code> (mono/code/labels).
+        </p>
+      </div>
+
+      <div class="surface card slide-up">
+        <div class="card-header">
+          <h3>Display &amp; Titles</h3>
+          <p class="text-sm">Reference sizes for hero, sections, and UI.</p>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: var(--space-lg)">
+          <div>
+            <div class="tag">.display — clamp(2.5rem → 5.5rem)</div>
+            <div class="display">Display Title</div>
+          </div>
+          <div class="divider"></div>
+          <div>
+            <div class="tag">h1 — clamp(2rem → 3.5rem)</div>
+            <h1>Heading One</h1>
+          </div>
+          <div>
+            <div class="tag">h2 — clamp(1.5rem → 2.25rem)</div>
+            <h2>Heading Two</h2>
+          </div>
+          <div>
+            <div class="tag">h3 — clamp(1.25rem → 1.75rem)</div>
+            <h3>Heading Three</h3>
+          </div>
+          <div>
+            <div class="tag">h4 — clamp(1.125rem → 1.375rem)</div>
+            <h4>Heading Four</h4>
+          </div>
+          <div>
+            <div class="tag">h5 — clamp(1rem → 1.125rem)</div>
+            <h5>Heading Five</h5>
+          </div>
+          <div>
+            <div class="tag">h6 — clamp(0.95rem → 1rem)</div>
+            <h6>Heading Six</h6>
+          </div>
+          <div class="divider"></div>
+          <div>
+            <div class="tag">p (body) — clamp(1rem → 1.125rem) • max-width: 70ch</div>
+            <p>
+              This is body text. Fluid UI uses a minimal, soft, high-contrast
+              type scale with generous line height for readability and a
+              glowy/flowing aesthetic.
+            </p>
+          </div>
+          <div>
+            <div class="tag">.text-sm — clamp(0.875rem → 0.95rem)</div>
+            <p class="text-sm">
+              Smaller supporting text for labels, metadata, or captions.
+            </p>
+          </div>
+          <div>
+            <div class="tag">.text-xs — clamp(0.75rem → 0.875rem)</div>
+            <p class="text-xs">Micro text for badges, hints, or timestamps.</p>
+          </div>
+          <div>
+            <div class="tag">.mono / code / .tag</div>
+            <p class="mono">
+              Monospaced: 123456 ABCDEF <code>inline code</code>
+              <span class="tag">label.tag</span>
+            </p>
+          </div>
+          <div>
+            <div class="tag">.fluid-text (animated gradient)</div>
+            <h3 class="fluid-text">Fluid Gradient Text Animation</h3>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Test Buttons -->
+    <section id="buttons">
+      <div class="section-header slide-up">
+        <span class="section-label">02 — Buttons</span>
+        <h2>Test Buttons (Variants + States)</h2>
+        <p>Fluid, glowy, minimal buttons with subtle motion and ripple.</p>
+      </div>
+
+      <div class="surface card slide-up">
+        <div class="card-header">
+          <h4>Primary &amp; Core</h4>
+          <p class="text-sm">Use for CTAs, actions, and navigation.</p>
+        </div>
+        <div class="button-group">
+          <button class="btn btn-primary btn--fluid ripple glow-ring">
+            Primary
+          </button>
+          <button class="btn btn-primary btn-cta btn--fluid ripple glow-ring pulse-glow">
+            CTA (Pulse Glow)
+          </button>
+          <button class="btn btn-secondary btn--fluid ripple glow-ring glow-ring--secondary">
+            Secondary
+          </button>
+          <button class="btn btn-ghost btn--fluid ripple">Ghost</button>
+          <button class="btn btn-ghost btn--fluid ripple shimmer">
+            Ghost + Shimmer
+          </button>
+        </div>
+      </div>
+
+      <div class="surface card slide-up">
+        <div class="card-header">
+          <h4>Status Variants</h4>
+          <p class="text-sm">Semantic test buttons for feedback states.</p>
+        </div>
+        <div class="button-group">
+          <button class="btn btn-success btn--fluid ripple glow-ring glow-ring--success">
+            Success
+          </button>
+          <button class="btn btn-warning btn--fluid ripple glow-ring glow-ring--warning">
+            Warning
+          </button>
+          <button class="btn btn-danger btn--fluid ripple glow-ring glow-ring--danger">
+            Danger
+          </button>
+        </div>
+      </div>
+
+      <div class="surface card slide-up">
+        <div class="card-header">
+          <h4>With Icons + Fluid Motion</h4>
+          <p class="text-sm">Demonstrates fluid sheen + ripple + float.</p>
+        </div>
+        <div class="button-group">
+          <button class="btn btn-primary btn--fluid ripple glow-ring float">
+            Primary + Float
+          </button>
+          <button class="btn btn-secondary btn--fluid ripple glow-ring glow-ring--secondary fluid-flow">
+            Fluid Flow
+          </button>
+          <button class="btn btn-ghost btn--fluid ripple">
+            <span>●</span>
+            <span>Icon Left</span>
+          </button>
+          <button class="btn btn-primary btn--fluid ripple glow-ring">
+            <span>Icon Right</span>
+            <span>→</span>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Reactive Glass Buttons -->
+    <section id="reactive-glass">
+      <div class="section-header slide-up">
+        <span class="section-label">02b — Reactive Glass Buttons</span>
+        <h2>Reactive Glassy Glow (Cursor-Following)</h2>
+        <p>
+          Fluid glass buttons with a reactive inner glow that follows your
+          cursor inside the button. Smooth, minimal, and GPU-friendly.
+        </p>
+      </div>
+
+      <div class="surface card slide-up">
+        <div class="card-header">
+          <h4>Core Reactive Glass</h4>
+          <p class="text-sm">
+            Hover to see the glow track to your cursor position.
+          </p>
+        </div>
+        <div class="button-group">
+          <button class="btn btn--glass btn-cta ripple tilt" data-glow="">
+            <span>Reactive Glass</span>
+          </button>
+          <button class="btn btn--glass btn--glass--secondary ripple tilt" data-glow="">
+            <span>Secondary Glow</span>
+          </button>
+          <button class="btn btn--glass btn--glass--accent ripple tilt" data-glow="">
+            <span>Accent Glow</span>
+          </button>
+          <button class="btn btn--glass btn--glass--success ripple tilt" data-glow="">
+            <span>Success Glow</span>
+          </button>
+          <button class="btn btn--glass btn--glass--warning ripple tilt" data-glow="">
+            <span>Warning Glow</span>
+          </button>
+          <button class="btn btn--glass btn--glass--danger ripple tilt" data-glow="">
+            <span>Danger Glow</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="surface card slide-up">
+        <div class="card-header">
+          <h4>3D Tilt + Reactive Glow</h4>
+          <p class="text-sm">
+            Combine <code>.tilt</code> with reactive glass for a fluid
+            micro-interaction.
+          </p>
+        </div>
+        <div class="button-group">
+          <button class="btn btn--glass btn-cta ripple tilt float" data-glow="">
+            <span>Float + Tilt + Glow</span>
+          </button>
+          <button class="btn btn--glass btn--glass--accent ripple tilt fluid-morph" data-glow="">
+            <span>Fluid Morph + Glow</span>
+          </button>
+          <button class="btn btn--glass btn--glass--secondary ripple tilt breath" data-glow="">
+            <span>Breath + Glow</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="surface card slide-up">
+        <div class="card-header">
+          <h4>Usage</h4>
+          <p class="text-sm">
+            Add <code>class="btn btn--glass"</code> and
+            <code>data-glow</code>, then include the small JS below to track
+            cursor.
+          </p>
+        </div>
+        <pre class="mono" style="
+              background: rgba(12, 14, 28, 0.65);
+              padding: clamp(1rem, 3vw, 1.25rem);
+              border-radius: var(--radius-md);
+              border: 1px solid rgba(255, 255, 255, 0.12);
+              overflow-x: auto;
+              font-size: clamp(0.75rem, 2vw, 0.875rem);
+              line-height: 1.9;
+            "><code>&lt;button class="btn btn--glass ripple tilt" data-glow&gt;
+  &lt;span&gt;Reactive Glass&lt;/span&gt;
+&lt;/button&gt;
+
+&lt;script&gt;
+  document.querySelectorAll('[data-glow]').forEach((btn)=&gt;{
+    btn.addEventListener('pointermove', (e)=&gt;{
+      const r = btn.getBoundingClientRect();
+      const x = ((e.clientX - r.left) / r.width) * 100;
+      const y = ((e.clientY - r.top) / r.height) * 100;
+      btn.style.setProperty('--glow-x', x + '%');
+      btn.style.setProperty('--glow-y', y + '%');
+    }, { passive: true });
+    btn.addEventListener('pointerleave', ()=&gt;{
+      btn.style.setProperty('--glow-x', '50%');
+      btn.style.setProperty('--glow-y', '0%');
+    });
+  });
+&lt;/script&gt;</code></pre>
+      </div>
+    </section>
+
+    <!-- Surfaces, Cards, Chips -->
+    <section id="surfaces">
+      <div class="section-header slide-up">
+        <span class="section-label">03 — Surfaces &amp; Cards</span>
+        <h2>Minimal Glass, Glow &amp; Fluid Cards</h2>
+        <p>
+          Soft blurred surfaces with subtle glowy borders and fluid motion on
+          hover.
+        </p>
+      </div>
+
+      <div class="grid grid-3">
+        <article class="surface card glow-ring slide-up">
+          <div class="card-header">
+            <span class="chip chip--glow">Fluid</span>
+            <h4>Glowy Card</h4>
+            <p class="text-sm">
+              Glassmorphism surface with soft inner glow, blur, and lift on
+              hover.
+            </p>
+          </div>
+          <div class="card-footer">
+            <button class="btn btn-primary btn--fluid ripple glow-ring">
+              Action
+            </button>
+            <button class="btn btn-ghost btn--fluid ripple">Learn More</button>
+          </div>
+        </article>
+
+        <article class="surface card glow-ring glow-ring--secondary slide-up">
+          <div class="card-header">
+            <span class="chip">Minimal</span>
+            <h4>Secondary Glow</h4>
+            <p class="text-sm">
+              Subtly tinted glow ring with fluid border transitions.
+            </p>
+          </div>
+          <div class="card-footer">
+            <button class="btn btn-secondary btn--fluid ripple glow-ring glow-ring--secondary">
+              Action
+            </button>
+            <span class="chip">Reference</span>
+          </div>
+        </article>
+
+        <article class="surface card glow-ring glow-ring--accent slide-up">
+          <div class="card-header">
+            <span class="chip">Accent</span>
+            <h4>Accent Flow</h4>
+            <p class="text-sm">
+              Clean card layout for showcasing features or UI blocks.
+            </p>
+          </div>
+          <div class="card-footer">
+            <button class="btn btn-ghost btn--fluid ripple">Details</button>
+            <span class="chip chip--glow">New</span>
+          </div>
+        </article>
+      </div>
+
+      <div class="surface card slide-up">
+        <div class="card-header">
+          <h4>Chips, Pills &amp; Badges</h4>
+          <p class="text-sm">Compact glowy tags for states and labels.</p>
+        </div>
+        <div class="button-group">
+          <span class="chip">Default</span>
+          <span class="chip chip--glow">Glowy</span>
+          <span class="chip">Info</span>
+          <span class="chip chip--glow">Active</span>
+          <span class="chip">Beta</span>
+          <span class="chip">Reference</span>
+        </div>
+      </div>
+
+      <div class="surface card slide-up">
+        <div class="card-header">
+          <h4>Inputs (Test Fields)</h4>
+          <p class="text-sm">Minimal fluid inputs with soft focus glow.</p>
+        </div>
+        <div class="grid grid-2">
+          <div class="field">
+            <label class="label mono" for="input-1">Input Label</label>
+            <input id="input-1" class="input" placeholder="Type something fluid...">
+          </div>
+          <div class="field">
+            <label class="label mono" for="input-2">Another Field</label>
+            <input id="input-2" class="input" placeholder="Glowy focus state...">
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Animations -->
+    <section id="animations">
+      <div class="section-header slide-up">
+        <span class="section-label">04 — Fluid Animations</span>
+        <h2>Animations Reference (Minimal &amp; Fluid)</h2>
+        <p>
+          Ready-to-use animation classes: <code>fade-in</code>,
+          <code>slide-up</code>, <code>scale-in</code>, <code>float</code>,
+          <code>pulse-glow</code>, <code>shimmer</code>,
+          <code>fluid-flow</code>, <code>fluid-text</code>,
+          <code>orb-breathe</code>, <code>orb-drift</code>.
+        </p>
+      </div>
+
+      <div class="grid grid-3">
+        <div class="surface card slide-up">
+          <div class="card-header">
+            <h5>Entrance (Fade/Slide/Scale)</h5>
+            <p class="text-xs">Smooth, fluid entrances.</p>
+          </div>
+          <div style="
+                display: flex;
+                flex-wrap: wrap;
+                gap: var(--space-sm);
+                align-items: center;
+              ">
+            <div class="chip fade-in">fade-in</div>
+            <div class="chip fade-in-up">fade-in-up</div>
+            <div class="chip fade-in-scale">fade-in-scale</div>
+            <div class="chip slide-up">slide-up</div>
+            <div class="chip slide-down">slide-down</div>
+            <div class="chip slide-in-left">slide-in-left</div>
+            <div class="chip slide-in-right">slide-in-right</div>
+            <div class="chip scale-in">scale-in</div>
+          </div>
+        </div>
+
+        <div class="surface card slide-up">
+          <div class="card-header">
+            <h5>Breathing / Float / Pulse</h5>
+            <p class="text-xs">Soft ambient, fluid motion.</p>
+          </div>
+          <div style="
+                display: flex;
+                flex-wrap: wrap;
+                gap: var(--space-sm);
+                align-items: center;
+              ">
+            <div class="chip float">float</div>
+            <div class="chip breath">breath</div>
+            <div class="chip pulse-glow">pulse-glow</div>
+            <div class="chip blob-pulse">blob-pulse</div>
+            <div class="chip sway">sway</div>
+            <div class="chip">orb-breathe (on orb)</div>
+          </div>
+        </div>
+
+        <div class="surface card slide-up">
+          <div class="card-header">
+            <h5>Sheen / Flow / Morph</h5>
+            <p class="text-xs">Fluid organic motion.</p>
+          </div>
+          <div style="
+                display: flex;
+                flex-wrap: wrap;
+                gap: var(--space-sm);
+                align-items: center;
+              ">
+            <div class="chip shimmer">shimmer</div>
+            <div class="chip fluid-flow">fluid-flow</div>
+            <div class="chip fluid-morph">fluid-morph</div>
+            <div class="chip">orb-drift (on orb)</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="surface card slide-up" style="align-items: center; text-align: center">
+        <div class="card-header" style="align-items: center">
+          <h4>Fluid Orb (Demo)</h4>
+          <p class="text-sm">
+            Minimal glowing fluid blob: combines <code>orb-breathe</code> +
+            <code>orb-drift</code>.
+          </p>
+        </div>
+        <div class="demo-orb scale-in"></div>
+        <p class="text-xs" style="color: var(--text-tertiary)">
+          Respects <code>prefers-reduced-motion</code>
+        </p>
+      </div>
+
+      <div class="surface card slide-up">
+        <div class="card-header">
+          <h4>Animation Usage Reference</h4>
+          <p class="text-sm">
+            Drop these classes onto any element to apply fluid motion. Keep
+            minimal and layer subtly.
+          </p>
+        </div>
+        <pre class="mono" style="
+              background: rgba(12, 14, 28, 0.65);
+              padding: clamp(1rem, 3vw, 1.25rem);
+              border-radius: var(--radius-md);
+              border: 1px solid rgba(255, 255, 255, 0.12);
+              overflow-x: auto;
+              font-size: clamp(0.75rem, 2vw, 0.875rem);
+              line-height: 1.9;
+            "><code>&lt;button class="btn btn-primary btn--fluid ripple glow-ring float"&gt;Float&lt;/button&gt;
+&lt;div class="surface card fluid-flow"&gt;Fluid Flow&lt;/div&gt;
+&lt;h1 class="fluid-text"&gt;Fluid Gradient Text&lt;/h1&gt;
+&lt;div class="demo-orb"&gt;&lt;/div&gt;  &lt;!-- has orb-breathe + orb-drift --&gt;</code></pre>
+      </div>
+    </section>
+
+    <!-- Style Tokens -->
+    <section id="tokens">
+      <div class="section-header slide-up">
+        <span class="section-label">05 — Design Tokens</span>
+        <h2>Minimal Tokens (For AI Reference)</h2>
+        <p>Core variables to reconstruct this fluid/glowy style easily.</p>
+      </div>
+
+      <div class="surface card slide-up">
+        <div class="card-header">
+          <h5>Glow, Radius, Spacing, Surfaces</h5>
+        </div>
+        <pre class="mono" style="
+              background: rgba(12, 14, 28, 0.65);
+              padding: clamp(1rem, 3vw, 1.25rem);
+              border-radius: var(--radius-md);
+              border: 1px solid rgba(255, 255, 255, 0.12);
+              overflow-x: auto;
+              font-size: clamp(0.75rem, 2vw, 0.875rem);
+              line-height: 1.9;
+            "><code>:root {
+  --bg-primary: radial-gradient(ellipse at top, #0f1026 0%, #050508 100%);
+  --bg-surface: rgba(20, 22, 40, 0.5);
+  --border-subtle: rgba(255,255,255,0.08);
+  --border-glow: rgba(120,140,255,0.25);
+  --glow-primary: 120,140,255;
+  --glow-secondary: 96,225,255;
+  --glow-accent: 168,120,255;
+  --text-primary: rgba(255,255,255,0.98);
+  --text-secondary: rgba(255,255,255,0.72);
+  --radius-lg: 20px; --radius-xl: 28px; --radius-full: 999px;
+  --space-md: 1rem; --space-lg: 1.5rem; --space-xl: 2rem;
+}</code></pre>
+      </div>
+    </section>
+  </main>
+
+    <!-- Cursor Section -->
+    <section id="cursor">
+      <div class="section-header slide-up">
+        <span class="section-label">06 — Cursor</span>
+        <h2>Custom Cursor (Reference)</h2>
+        <p>
+          Pulled from <code>falsecloudd-preview.html</code>, glow removed.
+          Add the HTML, CSS, and JS to enable the minimal dot cursor.
+          Respects <code>prefers-reduced-motion</code> and only runs on
+          hover-capable devices.
+        </p>
+      </div>
+
+      <div class="surface card slide-up">
+        <div class="card-header">
+          <h4>HTML</h4>
+          <p class="text-sm">Place this near the closing <code>&lt;/body&gt;</code> tag.</p>
+        </div>
+        <pre class="mono" style="
+              background: rgba(12, 14, 28, 0.65);
+              padding: clamp(1rem, 3vw, 1.25rem);
+              border-radius: var(--radius-md);
+              border: 1px solid rgba(255, 255, 255, 0.12);
+              overflow-x: auto;
+              font-size: clamp(0.75rem, 2vw, 0.875rem);
+              line-height: 1.9;
+            "><code>&lt;div class="cur dot" id="cd" aria-hidden="true"&gt;
+  &lt;b&gt;&lt;i&gt;&lt;/i&gt;&lt;/b&gt;
+&lt;/div&gt;</code></pre>
+      </div>
+
+      <div class="surface card slide-up">
+        <div class="card-header">
+          <h4>CSS (minimal, no glow)</h4>
+          <p class="text-sm">Includes <code>--text</code> and base styles.</p>
+        </div>
+        <pre class="mono" style="
+              background: rgba(12, 14, 28, 0.65);
+              padding: clamp(1rem, 3vw, 1.25rem);
+              border-radius: var(--radius-md);
+              border: 1px solid rgba(255, 255, 255, 0.12);
+              overflow-x: auto;
+              font-size: clamp(0.75rem, 2vw, 0.875rem);
+              line-height: 1.9;
+            "><code>.cur {
+  position: fixed;
+  top: 0; left: 0;
+  pointer-events: none;
+  z-index: 9999;
+  opacity: 0;
+  transition: opacity .2s;
+}
+.cursor-on .cur { opacity: 1; }
+.cursor-out .cur { opacity: 0; }
+.cur.dot { width: 8px; height: 8px; }
+.cur.dot b { display: block; width: 100%; height: 100%; will-change: transform, filter; }
+.cur.dot i {
+  display: block; width: 100%; height: 100%;
+  border-radius: 50%;
+  background: var(--text);
+  box-shadow: none;
+  transition: transform .25s cubic-bezier(.2,.8,.2,1), background-color .25s, box-shadow .25s;
+}
+.cur.dot.hot i { transform: scale(1.7); box-shadow: none; }
+.cur.dot.down i { transform: scale(.4); transition-duration: .08s; }
+.cur.dot.hot.down i { transform: scale(.4); }
+.cursor-on, html.cursor-on * { cursor: none !important; }</code></pre>
+      </div>
+
+      <div class="surface card slide-up">
+        <div class="card-header">
+          <h4>JS (simplified tracking)</h4>
+          <p class="text-sm">Attaches to <code>#cd</code> and toggles cursor states.</p>
+        </div>
+        <pre class="mono" style="
+              background: rgba(12, 14, 28, 0.65);
+              padding: clamp(1rem, 3vw, 1.25rem);
+              border-radius: var(--radius-md);
+              border: 1px solid rgba(255, 255, 255, 0.12);
+              overflow-x: auto;
+              font-size: clamp(0.75rem, 2vw, 0.875rem);
+              line-height: 1.9;
+            "><code>(function(){
+  if(!matchMedia('(hover:hover) and (pointer:fine)').matches)return;
+  var root=document.documentElement,dot=document.getElementById('cd');
+  var reduce=matchMedia('(prefers-reduced-motion:reduce)').matches;
+  var ease=reduce?1:.45;
+  var x=0,y=0,cx=0,cy=0,on=false,raf=0,last=0,s=0,ang=0,moved=0;
+  function draw(t){
+    var dt=Math.min(t-(last||t),50)||16.7,k=1-Math.pow(1-ease,dt/16.67);
+    last=t; var mx=(x-cx)*k,my=(y-cy)*k; cx+=mx; cy+=my;
+    var sp=Math.sqrt(mx*mx+my*my)*16.67/dt;
+    if(sp&gt;.5)ang=Math.atan2(my,mx);
+    var idle=t-moved&gt;80; var target=(reduce||idle)?0:Math.min(sp/26,1);
+    s+=(target-s)*(idle?.5:.3);
+    dot.style.transform='translate3d('+cx+'px,'+cy+'px,0) translate(-50%,-50%)';
+    if(s&gt;.01){
+      dot.firstElementChild.style.transform='rotate('+ang+'rad) scale('+(1+s*2.4)+','+(1-s*.22)+')';
+    }else{s=0;dot.firstElementChild.style.transform='none';}
+    if(Math.abs(x-cx)&gt;.1||Math.abs(y-cy)&gt;.1||s&gt;0){raf=requestAnimationFrame(draw)}else{raf=0;last=0}
+  }
+  document.addEventListener('mousemove',function(e){
+    x=e.clientX;y=e.clientY;moved=performance.now();
+    if(!on){on=true;cx=x;cy=y;root.classList.add('cursor-on');}
+    if(!raf)raf=requestAnimationFrame(draw);
+  });
+  document.addEventListener('mouseover',function(e){dot.classList.toggle('hot',!!e.target.closest('a,button,[role="button"]'));});
+  document.addEventListener('mousedown',function(){dot.classList.add('down');},true);
+  window.addEventListener('mouseup',function(){dot.classList.remove('down');},true);
+  root.addEventListener('mouseleave',function(){root.classList.add('cursor-out');});
+  root.addEventListener('mouseenter',function(e){x=e.clientX;y=e.clientY;cx=x;cy=y;s=0;root.classList.remove('cursor-out');});
+})();</code></pre>
+      </div>
+    </section>
+
+
+    <footer class="slide-up">
+      <p class="text-xs">
+        Fluid UI Library • Minimal • Glowy • For AI-driven website generation •
+        Place in <code>/home/jeremiah/UILib/</code>
+      </p>
+    </footer>
+  <script>
+    (function () {
+      if (!matchMedia('(hover:hover) and (pointer:fine)').matches) return;
+      var root = document.documentElement;
+      var dot = document.getElementById('cd');
+      if (dot) {
+        var reduce = matchMedia('(prefers-reduced-motion:reduce)').matches;
+        var ease = reduce ? 1 : 0.45;
+        var x = 0,
+          y = 0,
+          cx = 0,
+          cy = 0,
+          on = false,
+          raf = 0,
+          last = 0,
+          s = 0,
+          ang = 0,
+          moved = 0;
+        function draw(t) {
+          var dt = Math.min(t - (last || t), 50) || 16.7;
+          var k = 1 - Math.pow(1 - ease, dt / 16.67);
+          last = t;
+          var mx = (x - cx) * k,
+            my = (y - cy) * k;
+          cx += mx;
+          cy += my;
+          var sp = Math.sqrt(mx * mx + my * my) * 16.67 / dt;
+          if (sp > 0.5) ang = Math.atan2(my, mx);
+          var idle = t - moved > 80;
+          var target = (reduce || idle) ? 0 : Math.min(sp / 26, 1);
+          s += (target - s) * (idle ? 0.5 : 0.3);
+          dot.style.transform =
+            'translate3d(' + cx + 'px,' + cy + 'px,0) translate(-50%,-50%)';
+          if (s > 0.01) {
+            dot.firstElementChild.style.transform =
+              'rotate(' +
+              ang +
+              'rad) scale(' +
+              (1 + s * 2.4) +
+              ',' +
+              (1 - s * 0.22) +
+              ')';
+          } else {
+            s = 0;
+            dot.firstElementChild.style.transform = 'none';
+          }
+          if (Math.abs(x - cx) > 0.1 || Math.abs(y - cy) > 0.1 || s > 0) {
+            raf = requestAnimationFrame(draw);
+          } else {
+            raf = 0;
+            last = 0;
+          }
+        }
+        document.addEventListener('mousemove', function (e) {
+          x = e.clientX;
+          y = e.clientY;
+          moved = performance.now();
+          if (!on) {
+            on = true;
+            cx = x;
+            cy = y;
+            root.classList.add('cursor-on');
+          }
+          if (!raf) raf = requestAnimationFrame(draw);
+        });
+        document.addEventListener('mouseover', function (e) {
+          dot.classList.toggle(
+            'hot',
+            !!e.target.closest('a,button,[role="button"]')
+          );
+        });
+        document.addEventListener(
+          'mousedown',
+          function () {
+            dot.classList.add('down');
+          },
+          true
+        );
+        window.addEventListener(
+          'mouseup',
+          function () {
+            dot.classList.remove('down');
+          },
+          true
+        );
+        root.addEventListener('mouseleave', function () {
+          root.classList.add('cursor-out');
+        });
+        root.addEventListener('mouseenter', function (e) {
+          x = e.clientX;
+          y = e.clientY;
+          cx = x;
+          cy = y;
+          s = 0;
+          root.classList.remove('cursor-out');
+        });
+      }
+      // Reactive glass glow
+      document.querySelectorAll('[data-glow]').forEach(function (btn) {
+        btn.addEventListener(
+          'pointermove',
+          function (e) {
+            var r = btn.getBoundingClientRect();
+            var x = ((e.clientX - r.left) / r.width) * 100;
+            var y = ((e.clientY - r.top) / r.height) * 100;
+            btn.style.setProperty('--glow-x', x + '%');
+            btn.style.setProperty('--glow-y', y + '%');
+          },
+          { passive: true }
+        );
+        btn.addEventListener('pointerleave', function () {
+          btn.style.setProperty('--glow-x', '50%');
+          btn.style.setProperty('--glow-y', '0%');
+        });
+        btn.addEventListener('pointerdown', function () {
+          var r = btn.getBoundingClientRect();
+          // keep current or reset slightly
+        });
+      });
+      // Tilt tracking
+      document.querySelectorAll('.tilt').forEach(function (el) {
+        el.addEventListener(
+          'pointermove',
+          function (e) {
+            var r = el.getBoundingClientRect();
+            var x = e.clientX - r.left;
+            var y = e.clientY - r.top;
+            var midX = r.width / 2;
+            var midY = r.height / 2;
+            var rx = ((y - midY) / midY) * -6; // max 6deg
+            var ry = ((x - midX) / midX) * 6;
+            el.style.setProperty('--rx', rx.toFixed(2) + 'deg');
+            el.style.setProperty('--ry', ry.toFixed(2) + 'deg');
+          },
+          { passive: true }
+        );
+        el.addEventListener('pointerleave', function () {
+          el.style.setProperty('--rx', '0deg');
+          el.style.setProperty('--ry', '0deg');
+        });
+      });
+    })();
+  </script>
+
+  <script>
+    (function () {
+      var btn = document.getElementById('novify-btn');
+      if (!btn) return;
+      function save(text) {
+        var blob = new Blob([text], { type: 'text/html;charset=utf-8' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = 'fluid-ui-library.html';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+      }
+      btn.addEventListener('click', function () {
+        // try the original source first, fall back to the live DOM (works on file://)
+        fetch(location.href, { cache: 'no-store' })
+          .then(function (r) { if (!r.ok) throw 0; return r.text(); })
+          .then(save)
+          .catch(function () {
+            save('<!DOCTYPE html>\n' + document.documentElement.outerHTML);
+          });
+      });
+    })();
+  </script>
+
+
+
+</body></html>

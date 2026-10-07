@@ -4,3 +4,7 @@ basically nova is a vibecoding project to help people make websites quicker and 
 
 -VISUALS-
 nova ui also has a website to easily preview the design and functionality of that specific style. https://novalib.netlify.app/
+
+-EXAMPLES- ==== examples of nova in web projects (only made by me for now)
+https://rescounter.netlify.app/
+https://novalensai.netlify.app/

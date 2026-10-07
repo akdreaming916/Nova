@@ -8,5 +8,5 @@ nova ui also has a website to easily preview the design and functionality of tha
 
 -EXAMPLES- ==== examples of nova in web projects (only made by me for now)
 
-https://rescounter.netlify.app/
+https://rescounter.netlify.app/ 
 https://novalensai.netlify.app/
